@@ -1,40 +1,34 @@
 #!/usr/bin/env python3
 """
 ╔══════════════════════════════════════════╗
-║     CATBOX TELEGRAM UPLOAD BOT 🐈        ║
-║  Videos (200MB) + Images — Direct Links  ║
-║  Railway Ready — ENV vars config         ║
+║     CATBOX TELEGRAM BOT 🐈  v3           ║
+║  Pyrogram (MTProto) — 2GB file support   ║
+║  Videos + Images → Catbox direct links   ║
 ╚══════════════════════════════════════════╝
-FIXES v2:
-  - Forwarded videos detected properly (document handler)
-  - file_size=0/None no longer causes false rejection
-  - Real size checked AFTER download
-  - All links reply to original video message
-  - Timeout increased for large files
-  - Mid-upload progress animation
+ENV VARS needed on Railway:
+  BOT_TOKEN       — from @BotFather
+  API_ID          — from my.telegram.org
+  API_HASH        — from my.telegram.org
+  CATBOX_USERHASH — from catbox.moe settings
+  ADMIN_ID        — your Telegram numeric ID
 """
 
 import os
 import asyncio
 import aiohttp
-import aiofiles
 import logging
 import time
-from telegram import Update, Message
-from telegram.ext import (
-    Application,
-    CommandHandler,
-    MessageHandler,
-    ContextTypes,
-    filters,
-)
-from telegram.constants import ParseMode
+from pyrogram import Client, filters
+from pyrogram.types import Message
+from pyrogram.enums import ParseMode
 
-# ─────────────────────────────────────────
-BOT_TOKEN       = os.environ.get("BOT_TOKEN", "")
-CATBOX_USERHASH = os.environ.get("CATBOX_USERHASH", "")
-ADMIN_ID        = int(os.environ.get("ADMIN_ID", "0"))
-TEMP_DIR        = "/tmp/catbox_uploads"
+# ── CONFIG ────────────────────────────────
+BOT_TOKEN       = os.environ["BOT_TOKEN"]
+API_ID          = int(os.environ["API_ID"])
+API_HASH        = os.environ["API_HASH"]
+CATBOX_USERHASH = os.environ["CATBOX_USERHASH"]
+ADMIN_ID        = int(os.environ["ADMIN_ID"])
+TEMP_DIR        = "/tmp/catbox"
 MAX_MB          = 200
 MAX_BYTES       = MAX_MB * 1024 * 1024
 CATBOX_API      = "https://catbox.moe/user/api.php"
@@ -47,7 +41,19 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 os.makedirs(TEMP_DIR, exist_ok=True)
 
+app = Client(
+    "catbox_bot",
+    api_id=API_ID,
+    api_hash=API_HASH,
+    bot_token=BOT_TOKEN,
+    # Store session in /tmp so Railway doesn't complain
+    workdir="/tmp",
+)
 
+
+# ════════════════════════════════════════
+#  HELPERS
+# ════════════════════════════════════════
 def human_size(b: int) -> str:
     if not b:
         return "? B"
@@ -58,74 +64,100 @@ def human_size(b: int) -> str:
     return f"{b:.1f} TB"
 
 
-def progress_bar(done: int, total: int, w: int = 18) -> str:
+def pbar(done: int, total: int, w: int = 18) -> str:
     if total == 0:
         return "▒" * w + " ..."
-    filled = max(0, min(w, int(w * done / total)))
-    return "█" * filled + "░" * (w - filled) + f" {done*100//total}%"
+    pct  = min(done / total, 1.0)
+    fill = int(w * pct)
+    return "█" * fill + "░" * (w - fill) + f" {int(pct*100)}%"
 
 
 async def safe_edit(msg: Message, text: str):
     try:
-        await msg.edit_text(text, parse_mode=ParseMode.MARKDOWN)
+        await msg.edit_text(text)
     except Exception:
         pass
 
 
-async def tg_download(file_obj, dest: str, prog_msg: Message, name: str):
-    timeout = aiohttp.ClientTimeout(total=600, connect=30)
-    tg_file = await file_obj.get_file()
-    total   = tg_file.file_size or 0
-    done    = 0
-    last_t  = 0.0
+# ════════════════════════════════════════
+#  PYROGRAM DOWNLOAD with progress
+#  (MTProto — supports up to 2GB)
+# ════════════════════════════════════════
+async def pyro_download(msg_with_media: Message, dest: str,
+                        prog_msg: Message, name: str) -> str:
+    """
+    Download using Pyrogram's built-in download method.
+    This uses MTProto — can handle files up to 2GB.
+    Returns final path.
+    """
+    total    = 0
+    last_t   = [0.0]   # mutable for closure
 
-    async with aiofiles.open(dest, "wb") as f:
-        async with aiohttp.ClientSession(timeout=timeout) as s:
-            async with s.get(tg_file.file_path) as r:
-                async for chunk in r.content.iter_chunked(131072):
-                    await f.write(chunk)
-                    done += len(chunk)
-                    now = time.time()
-                    if now - last_t > 2.0:
-                        await safe_edit(
-                            prog_msg,
-                            f"📥 *Downloading...*\n"
-                            f"📁 `{name}`\n"
-                            f"`{progress_bar(done, total)}`\n"
-                            f"_{human_size(done)} / {human_size(total)}_"
-                        )
-                        last_t = now
+    # Get file size from media object
+    media = (
+        msg_with_media.video
+        or msg_with_media.document
+        or msg_with_media.photo
+        or msg_with_media.animation
+    )
+    if media:
+        total = getattr(media, "file_size", 0) or 0
+
+    async def progress(current, total_bytes):
+        now = time.time()
+        if now - last_t[0] > 2.0:
+            bar = pbar(current, total_bytes)
+            await safe_edit(
+                prog_msg,
+                f"📥 **Downloading...**\n"
+                f"📁 `{name}`\n"
+                f"`{bar}`\n"
+                f"_{human_size(current)} / {human_size(total_bytes)}_"
+            )
+            last_t[0] = now
+
+    path = await msg_with_media.download(
+        file_name=dest,
+        progress=progress,
+    )
+    return path
 
 
+# ════════════════════════════════════════
+#  CATBOX UPLOAD
+# ════════════════════════════════════════
 async def catbox_upload(path: str, prog_msg: Message, name: str) -> str:
     size    = os.path.getsize(path)
     timeout = aiohttp.ClientTimeout(total=600, connect=30)
 
     await safe_edit(
         prog_msg,
-        f"☁️ *Uploading to Catbox...*\n"
+        f"☁️ **Uploading to Catbox...**\n"
         f"📁 `{name}`\n"
         f"`{'░' * 18} 0%`\n"
         f"_Connecting..._"
     )
 
-    async def progress_ticker():
+    # Animated progress ticker while upload happens
+    async def ticker():
         steps = [
-            (4,  f"`{'█'*4 + '░'*14} 22%`\n_Uploading..._"),
-            (5,  f"`{'█'*8 + '░'*10} 44%`\n_Uploading..._"),
-            (5,  f"`{'█'*12 + '░'*6} 66%`\n_Almost there..._"),
-            (5,  f"`{'█'*15 + '░'*3} 83%`\n_Finishing..._"),
+            (4,  6,  "22%",  "Uploading..."),
+            (5,  9,  "50%",  "Uploading..."),
+            (6,  13, "72%",  "Almost done..."),
+            (6,  16, "89%",  "Finishing..."),
         ]
-        for delay, bar in steps:
+        for delay, fill, pct, label in steps:
             await asyncio.sleep(delay)
+            bar = "█" * fill + "░" * (18 - fill)
             await safe_edit(
                 prog_msg,
-                f"☁️ *Uploading to Catbox...*\n"
+                f"☁️ **Uploading to Catbox...**\n"
                 f"📁 `{name}`\n"
-                f"{bar}"
+                f"`{bar} {pct}`\n"
+                f"_{human_size(size)} — {label}_"
             )
 
-    ticker = asyncio.create_task(progress_ticker())
+    tick_task = asyncio.create_task(ticker())
 
     try:
         async with aiohttp.ClientSession(timeout=timeout) as session:
@@ -141,191 +173,197 @@ async def catbox_upload(path: str, prog_msg: Message, name: str) -> str:
                 async with session.post(CATBOX_API, data=form) as resp:
                     result = (await resp.text()).strip()
     finally:
-        ticker.cancel()
+        tick_task.cancel()
 
     return result
 
 
-async def handle_upload(
-    update:   Update,
-    ctx:      ContextTypes.DEFAULT_TYPE,
-    file_obj,
-    name:     str,
-    size:     int,
-    orig_msg: Message,
-    kind:     str,
-):
-    user  = update.effective_user
-    uname = f"@{user.username}" if user.username else user.first_name
+# ════════════════════════════════════════
+#  CORE UPLOAD PIPELINE
+# ════════════════════════════════════════
+async def handle_upload(client: Client, orig_msg: Message, kind: str):
+    """Full pipeline: detect → download → upload → reply link"""
 
-    # Only reject if size is KNOWN and over limit (size=0 = unknown, let through)
+    user  = orig_msg.from_user
+    uname = f"@{user.username}" if user and user.username else (
+            user.first_name if user else "Unknown")
+
+    # ── Detect media and name ──
+    media = None
+    name  = "file"
+    size  = 0
+
+    if kind == "video":
+        if orig_msg.video:
+            media = orig_msg.video
+            name  = media.file_name or f"video_{media.file_id[:8]}.mp4"
+            size  = media.file_size or 0
+        elif orig_msg.document:
+            media = orig_msg.document
+            name  = media.file_name or f"video_{media.file_id[:8]}.mp4"
+            size  = media.file_size or 0
+            if not any(name.lower().endswith(e) for e in
+                       [".mp4",".mkv",".avi",".mov",".webm",".flv"]):
+                name += ".mp4"
+        elif orig_msg.animation:
+            media = orig_msg.animation
+            name  = media.file_name or f"anim_{media.file_id[:8]}.mp4"
+            size  = media.file_size or 0
+
+    elif kind == "image":
+        if orig_msg.photo:
+            media = orig_msg.photo
+            name  = f"photo_{orig_msg.id}.jpg"
+            size  = media.file_size or 0
+        elif orig_msg.document:
+            media = orig_msg.document
+            name  = media.file_name or f"image_{media.file_id[:8]}.jpg"
+            size  = media.file_size or 0
+
+    if not media:
+        return
+
+    # ── Size check (only if Telegram told us the size) ──
     if size > 0 and size > MAX_BYTES:
         await orig_msg.reply_text(
-            f"❌ *File too large!*\n"
-            f"Size: `{human_size(size)}`\n"
-            f"Catbox limit: `{MAX_MB} MB`",
-            parse_mode=ParseMode.MARKDOWN,
+            f"❌ **Too large!**\n"
+            f"`{human_size(size)}` > limit `{MAX_MB} MB`\n\n"
+            f"_Catbox free limit is 200 MB._"
         )
         return
 
-    # This reply is linked to the original video message
+    # ── Reply progress msg to original ──
     prog = await orig_msg.reply_text(
-        f"⏳ *Starting...*\n📁 `{name}`",
-        parse_mode=ParseMode.MARKDOWN,
+        f"⏳ **Starting...**\n📁 `{name}`"
     )
 
-    dest = os.path.join(TEMP_DIR, f"{prog.message_id}_{name}")
+    dest = os.path.join(TEMP_DIR, f"{orig_msg.id}_{prog.id}_{name}")
 
     try:
-        await tg_download(file_obj, dest, prog, name)
+        # Phase 1 — MTProto download
+        await pyro_download(orig_msg, dest, prog, name)
 
         real_size = os.path.getsize(dest)
 
         if real_size > MAX_BYTES:
-            await prog.edit_text(
-                f"❌ *Too large after download!*\n"
-                f"`{human_size(real_size)}` > `{MAX_MB} MB`",
-                parse_mode=ParseMode.MARKDOWN,
+            await safe_edit(
+                prog,
+                f"❌ **File too large!**\n"
+                f"`{human_size(real_size)}` > `{MAX_MB} MB`"
             )
             return
 
+        # Phase 2 — Catbox upload
         url = await catbox_upload(dest, prog, name)
 
+        # Phase 3 — Done!
         if url.startswith("https://"):
             em = "🎬" if kind == "video" else "🖼️"
-            await prog.edit_text(
-                f"{em} *Done!*\n\n"
+            await safe_edit(
+                prog,
+                f"{em} **Done!**\n\n"
                 f"📁 `{name}`\n"
                 f"📦 `{human_size(real_size)}`\n\n"
                 f"🔗 `{url}`\n\n"
-                f"_Tap to copy_ 👆",
-                parse_mode=ParseMode.MARKDOWN,
+                f"_Tap to copy 👆_"
             )
-            log.info(f"✅ {uname} uploaded {name} → {url}")
+            log.info(f"✅ {uname} | {name} → {url}")
 
-            if update.effective_chat.id != ADMIN_ID:
+            # Admin notification
+            if orig_msg.chat.id != ADMIN_ID:
                 try:
-                    await ctx.bot.send_message(
+                    await client.send_message(
                         ADMIN_ID,
-                        f"{em} *New Upload*\n👤 {uname}\n📁 `{name}`\n📦 `{human_size(real_size)}`\n🔗 `{url}`",
-                        parse_mode=ParseMode.MARKDOWN,
+                        f"{em} **New Upload**\n"
+                        f"👤 {uname}\n"
+                        f"📁 `{name}`\n"
+                        f"📦 `{human_size(real_size)}`\n"
+                        f"🔗 `{url}`"
                     )
                 except Exception:
                     pass
         else:
-            await prog.edit_text(
-                f"❌ *Catbox Error!*\n`{url}`",
-                parse_mode=ParseMode.MARKDOWN,
+            await safe_edit(
+                prog,
+                f"❌ **Catbox Error!**\n`{url}`\n\n"
+                f"_Check CATBOX\\_USERHASH in Railway vars._"
             )
 
-    except asyncio.TimeoutError:
-        await safe_edit(prog, f"❌ *Timeout!* File took too long.\n📁 `{name}`")
     except Exception as e:
-        log.exception(f"Error uploading {name}")
-        await safe_edit(prog, f"❌ *Error!*\n`{str(e)[:300]}`")
+        log.exception(f"Upload error: {name}")
+        await safe_edit(prog, f"❌ **Error!**\n`{str(e)[:300]}`")
     finally:
         if os.path.exists(dest):
             os.remove(dest)
 
 
-async def cmd_start(update: Update, _: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "🐈 *Catbox Upload Bot*\n\n"
+# ════════════════════════════════════════
+#  PYROGRAM HANDLERS
+# ════════════════════════════════════════
+
+@app.on_message(filters.command(["start", "help"]))
+async def cmd_start(client: Client, msg: Message):
+    await msg.reply_text(
+        "🐈 **Catbox Upload Bot**\n\n"
         "Send me:\n"
-        "• 🎬 *Video* (max 200 MB) → direct `.mp4` link\n"
-        "• 🖼️ *Photo / Image* → direct link\n"
-        "• 📎 *File* (video/image as document) → works too!\n\n"
-        "⚡ Multiple files = *simultaneous uploads!*\n"
-        "💬 Link is replied to your original message.",
-        parse_mode=ParseMode.MARKDOWN,
+        "• 🎬 **Video** (up to 200 MB) → direct `.mp4` link\n"
+        "• 🖼️ **Photo / Image** → direct link\n"
+        "• 📎 **File** (video as document) → also works!\n\n"
+        "⚡ Multiple files = **simultaneous uploads!**\n"
+        "💬 Links reply to your original message.\n"
+        "🔗 Catbox links are **permanent.**"
     )
 
 
-async def cmd_stats(update: Update, _: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != ADMIN_ID:
-        await update.message.reply_text("❌ Admin only!")
-        return
+@app.on_message(filters.command("stats") & filters.user(ADMIN_ID))
+async def cmd_stats(client: Client, msg: Message):
     try:
         tmp = len(os.listdir(TEMP_DIR))
     except Exception:
         tmp = 0
-    await update.message.reply_text(
-        f"📊 *Stats*\n🗂 Temp files: `{tmp}`\n📦 Max: `{MAX_MB} MB`",
-        parse_mode=ParseMode.MARKDOWN,
+    await msg.reply_text(
+        f"📊 **Stats**\n"
+        f"🗂 Temp files: `{tmp}`\n"
+        f"📦 Max: `{MAX_MB} MB`"
     )
 
 
-async def on_video(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    msg   = update.message
-    video = msg.video
-    if not video:
-        return
-    name = video.file_name or f"video_{video.file_id[:8]}.mp4"
-    asyncio.create_task(
-        handle_upload(update=update, ctx=ctx, file_obj=video,
-                      name=name, size=video.file_size or 0,
-                      orig_msg=msg, kind="video")
-    )
+# VIDEO — inline player
+@app.on_message(filters.video & ~filters.edited)
+async def on_video(client: Client, msg: Message):
+    asyncio.create_task(handle_upload(client, msg, "video"))
 
 
-async def on_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    msg   = update.message
-    photo = msg.photo[-1]
-    name  = f"photo_{photo.file_id[:8]}.jpg"
-    asyncio.create_task(
-        handle_upload(update=update, ctx=ctx, file_obj=photo,
-                      name=name, size=photo.file_size or 0,
-                      orig_msg=msg, kind="image")
-    )
+# ANIMATION / GIF
+@app.on_message(filters.animation & ~filters.edited)
+async def on_animation(client: Client, msg: Message):
+    asyncio.create_task(handle_upload(client, msg, "video"))
 
 
-async def on_document(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    msg  = update.message
+# PHOTO — compressed
+@app.on_message(filters.photo & ~filters.edited)
+async def on_photo(client: Client, msg: Message):
+    asyncio.create_task(handle_upload(client, msg, "image"))
+
+
+# DOCUMENT — video or image sent as file
+@app.on_message(filters.document & ~filters.edited)
+async def on_document(client: Client, msg: Message):
     doc  = msg.document
     mime = doc.mime_type or ""
-    name = doc.file_name or f"file_{doc.file_id[:8]}"
-    size = doc.file_size or 0
-
     if mime.startswith("video/"):
-        kind = "video"
-        if not any(name.lower().endswith(e) for e in [".mp4",".mkv",".avi",".mov",".webm",".flv"]):
-            name += ".mp4"
+        asyncio.create_task(handle_upload(client, msg, "video"))
     elif mime.startswith("image/"):
-        kind = "image"
+        asyncio.create_task(handle_upload(client, msg, "image"))
     else:
         await msg.reply_text(
-            "⚠️ *Unsupported!* Send videos or images only.",
-            parse_mode=ParseMode.MARKDOWN,
+            "⚠️ **Unsupported file!**\nSend **videos** or **images** only."
         )
-        return
-
-    asyncio.create_task(
-        handle_upload(update=update, ctx=ctx, file_obj=doc,
-                      name=name, size=size, orig_msg=msg, kind=kind)
-    )
 
 
-def main():
-    if not BOT_TOKEN:
-        raise ValueError("BOT_TOKEN env var missing!")
-    if not CATBOX_USERHASH:
-        raise ValueError("CATBOX_USERHASH env var missing!")
-    if ADMIN_ID == 0:
-        raise ValueError("ADMIN_ID env var missing!")
-
-    log.info(f"🐈 Starting | Admin:{ADMIN_ID} | Max:{MAX_MB}MB")
-
-    app = Application.builder().token(BOT_TOKEN).build()
-    app.add_handler(CommandHandler("start",  cmd_start))
-    app.add_handler(CommandHandler("help",   cmd_start))
-    app.add_handler(CommandHandler("stats",  cmd_stats))
-    app.add_handler(MessageHandler(filters.VIDEO,        on_video))
-    app.add_handler(MessageHandler(filters.PHOTO,        on_photo))
-    app.add_handler(MessageHandler(filters.Document.ALL, on_document))
-
-    log.info("✅ Polling...")
-    app.run_polling(drop_pending_updates=True)
-
-
+# ════════════════════════════════════════
+#  START
+# ════════════════════════════════════════
 if __name__ == "__main__":
-    main()
+    log.info(f"🐈 Catbox Bot (Pyrogram) | Admin:{ADMIN_ID} | Max:{MAX_MB}MB")
+    app.run()
