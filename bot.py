@@ -329,25 +329,25 @@ async def cmd_stats(client: Client, msg: Message):
 
 
 # VIDEO — inline player
-@app.on_message(filters.video & ~filters.edited)
+@app.on_message(filters.video)
 async def on_video(client: Client, msg: Message):
     asyncio.create_task(handle_upload(client, msg, "video"))
 
 
 # ANIMATION / GIF
-@app.on_message(filters.animation & ~filters.edited)
+@app.on_message(filters.animation)
 async def on_animation(client: Client, msg: Message):
     asyncio.create_task(handle_upload(client, msg, "video"))
 
 
 # PHOTO — compressed
-@app.on_message(filters.photo & ~filters.edited)
+@app.on_message(filters.photo)
 async def on_photo(client: Client, msg: Message):
     asyncio.create_task(handle_upload(client, msg, "image"))
 
 
 # DOCUMENT — video or image sent as file
-@app.on_message(filters.document & ~filters.edited)
+@app.on_message(filters.document)
 async def on_document(client: Client, msg: Message):
     doc  = msg.document
     mime = doc.mime_type or ""
